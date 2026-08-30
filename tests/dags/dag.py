@@ -1,34 +1,44 @@
 """
-Семейства celery_dag_NN (10 шт.) и kubernetes_dag_NN (10 шт.) — сплит 10/10.
+Семейства celery_dag_NN (10 шт.) и kubernetes_dag_NN (10 шт.) — сплит 10/10
++ управляемая нагрузка на CPU и RAM в каждом DAG'е.
 
 Стенд: Airflow 3.2.2 (Helm chart 1.22.0, kind), мульти-executor:
     AIRFLOW__CORE__EXECUTOR = "KubernetesExecutor,CeleryExecutor"
 Дефолтный executor — ПЕРВЫЙ в списке, т.е. KubernetesExecutor.
 
-Отличие от прошлой версии (executor_matrix_test_NN):
-    - старые DAG'и ИСЧЕЗНУТ из UI после синка этого файла (файл заменён);
-    - теперь 20 DAG'ов с ЧИСТЫМ сплитом: 10 строго celery + 10 строго k8s;
-    - НЕТ перекрёстных задач (никаких celery_explicit внутри k8s-DAG'а);
-    - КАЖДАЯ задача пинается ЯВНО через .override(executor=...) И ПЛЮС
-      default_args={"executor": ...} на весь DAG. Маршрутизация больше не
-      зависит от того, какой executor дефолтный в кластере.
+Структура каждого DAG'а (4 задачи):
+    probe_1..3   -> параллельные зонды места выполнения (как раньше)
+    cpu_ram_load -> НАГРУЗКА: CPU (N процессов × X секунд, 100% ядро)
+                    + RAM (Y МБ, затрагиваются страницы, держится всю нагрузку)
+    report       -> сводная таблица проб + VERDICT: OK/MISMATCH
+                    (запускается после нагрузки)
 
-Имена DAG'ов = их executor (удобно фильтровать в UI по тегам
-"celery" / "kubernetes" и смотреть в Flower: celery_dag_* там есть,
-kubernetes_dag_* там быть НЕ должно — это норма).
+Профиль нагрузки масштабируется по номеру DAG'а (idx = 1..10):
+    cpu_seconds = LOAD_CPU_BASE_SEC + idx        -> 11..20 сек
+    ram_mb      = LOAD_RAM_BASE_MB + idx*STEP    -> 80..224 МБ
+    процессов всегда LOAD_CPU_PROCS (2)
 
-Как проверить, что сплит работает (минимум ручной работы):
-    1) открой любой запуск -> задача `report` -> лог: таблица проб и
-       вердикт "VERDICT: OK" / "VERDICT: MISMATCH" + XCom с summary;
-    2) celery_dag_*: hostname задач = airflow-worker-N (StatefulSet воркеров);
-    3) kubernetes_dag_*: hostname = имя ephemeral-пода, маркер
-       AIRFLOW_IS_K8S_EXECUTOR_POD=True; в `kubectl get pods -n airflow` при
-       каждом запуске мелькают поды kubernetes-dag-*-*;
-    4) UI: Task Instance Details -> Hostname; теги celеry/kubernetes.
+Где нагрузка живёт:
+    - celery_dag_*: ВНУТРИ подов celery-воркеров (airflow-worker-N) —
+      нагружаются сами воркеры, pod_override игнорируется;
+    - kubernetes_dag_*: отдельные ephemeral-поды с pod_override:
+      requests 250m/256Mi, limits 1 CPU/512Mi, лейбл airflow-load=cpu-ram.
+      Имя контейнера ОБЯЗАНО быть "base" (strategic merge с pod_template).
 
-Нагрузка (20 DAG'ов, cron раз в минуту, по 4 задачи):
-    ~30 ephemeral-подов k8s + ~30 celery-задач в минуту.
-    Если kind не справляется: CRON = "*/2 * * * *" или пауза части DAG'ов.
+Куда смотреть:
+    - лог задачи cpu_ram_load: elapsed, exitcodes процессов, ru_maxrss;
+    - Grafana: node exporter (CPU/RAM нод), cAdvisor/kubelet (контейнеры),
+      Flower (длительность celery-задач);
+    - kubectl -n airflow get pods -w: поды нагрузки k8s живут ~40-60 сек.
+      (kubectl top может не работать — в kind нет metrics-server).
+
+Безопасность:
+    - RAM ограничена (<=224 МБ на задачу), CPU-процессы daemon=True
+      (умрут вместе с родителем), execution_timeout=3 мин, retries=0
+      (нагрузка не перезапускается);
+    - worst case celery: 10 задач/мин на 5 воркеров = до 2 нагрузок
+      на воркер (4 ядра на 11-20 сек, ~450 МБ пиково);
+    - если kind давится: LOAD_CPU_PROCS=1, LOAD_RAM_STEP_MB=8, cron "*/2".
 
 Служебное (чтобы не регрессировать):
     .override() есть только у объекта, возвращаемого декоратором @task
@@ -44,6 +54,7 @@ import socket
 from datetime import timedelta
 
 import pendulum
+from kubernetes.client import models as k8s
 
 try:
     from airflow.sdk import dag, get_current_context, task
@@ -56,6 +67,15 @@ CRON = "* * * * *"  # каждую минуту
 
 CELERY = "CeleryExecutor"
 K8S = "KubernetesExecutor"
+
+# --- ручки нагрузки -------------------------------------------------------
+LOAD_CPU_PROCS = 2        # процессов, жгущих ядро на 100%
+LOAD_CPU_BASE_SEC = 10    # секунд горения: + idx -> 11..20
+LOAD_RAM_BASE_MB = 64     # МБ RAM: + idx * LOAD_RAM_STEP_MB -> 80..224
+LOAD_RAM_STEP_MB = 16
+K8S_LOAD_REQUESTS = {"cpu": "250m", "memory": "256Mi"}
+K8S_LOAD_LIMITS = {"cpu": "1", "memory": "512Mi"}
+# --------------------------------------------------------------------------
 
 
 def _collect_facts(label: str) -> dict:
@@ -105,6 +125,109 @@ def _where_am_i(label: str) -> dict:
     return facts
 
 
+# --- нагрузка CPU/RAM ------------------------------------------------------
+
+def _generate_cpu_load(seconds: int, procs: int) -> dict:
+    """Жжёт CPU: `procs` дочерних процессов по 100% ядра `seconds` секунд.
+
+    Обычная функция (не @task) — удобно вынести и тестировать отдельно.
+    """
+    import multiprocessing as mp
+    import time
+
+    def _spin(stop_ts: float) -> None:
+        x = 1.000001
+        while time.monotonic() < stop_ts:
+            for _ in range(50_000):
+                x = (x * 1.0000001) % 999_983
+
+    started = time.monotonic()
+    stop_ts = started + seconds
+    ctx = (
+        mp.get_context("fork")
+        if "fork" in mp.get_all_start_methods()
+        else mp.get_context("spawn")
+    )
+    workers = [
+        ctx.Process(target=_spin, args=(stop_ts,), daemon=True)
+        for _ in range(max(1, procs))
+    ]
+    for w in workers:
+        w.start()
+    for w in workers:
+        w.join(timeout=seconds + 60)
+    return {
+        "procs": len(workers),
+        "seconds": seconds,
+        "elapsed_sec": round(time.monotonic() - started, 1),
+        "exitcodes": [w.exitcode for w in workers],
+    }
+
+
+def _touch_and_hold_ram(mb: int) -> bytearray:
+    """Аллоцирует mb МБ и затрагивает каждую страницу ( resident set)."""
+    block = bytearray(mb * 1024 * 1024)
+    for i in range(0, len(block), 4096):
+        block[i] = 1
+    return block
+
+
+def _k8s_load_pod_override() -> dict:
+    """executor_config для подов нагрузки в kubernetes_dag_*.
+
+    Имя контейнера ОБЯЗАНО совпадать с базовым ("base") — стратегический
+    merge с pod_template (git-sync init сохраняется).
+    """
+    return {
+        "pod_override": k8s.V1Pod(
+            metadata=k8s.V1ObjectMeta(labels={"airflow-load": "cpu-ram"}),
+            spec=k8s.V1PodSpec(
+                containers=[
+                    k8s.V1Container(
+                        name="base",
+                        resources=k8s.V1ResourceRequirements(
+                            requests=K8S_LOAD_REQUESTS,
+                            limits=K8S_LOAD_LIMITS,
+                        ),
+                    )
+                ]
+            ),
+        )
+    }
+
+
+@task
+def _cpu_ram_load(idx: int, cpu_seconds: int, cpu_procs: int, ram_mb: int) -> dict:
+    """Нагрузка: RAM держится ВСЁ время горения CPU (параллельно)."""
+    import resource
+    import time
+
+    print(
+        f"[load] DAG #{idx}: CPU {cpu_procs} x {cpu_seconds}s, "
+        f"RAM {ram_mb} MB (держится всё время нагрузки)"
+    )
+    started = time.monotonic()
+    block = _touch_and_hold_ram(ram_mb)
+    cpu_result = _generate_cpu_load(cpu_seconds, cpu_procs)
+    # ru_maxrss на Linux в КБ -> МБ; включает пик самого процесса
+    maxrss_mb = round(
+        resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 1
+    )
+    del block
+    result = {
+        "dag_index": idx,
+        "ram_mb": ram_mb,
+        "maxrss_mb": maxrss_mb,
+        "total_elapsed_sec": round(time.monotonic() - started, 1),
+        **cpu_result,
+    }
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return result
+
+
+# --------------------------------------------------------------------------
+
+
 def _observed_kind(facts: dict) -> str:
     """Классификация места выполнения по надёжным маркерам.
 
@@ -152,8 +275,16 @@ def _report(expected_kind: str, *results: dict) -> dict:
     }
 
 
-def _build_split_dag(dag_id: str, executor: str, expected_kind: str, group_tag: str) -> None:
+def _build_split_dag(
+    dag_id: str, executor: str, expected_kind: str, group_tag: str, idx: int
+) -> None:
     """Фабрика одного DAG'а; цикл в конце файла создаёт 10 celery + 10 k8s."""
+    cpu_seconds = LOAD_CPU_BASE_SEC + idx
+    ram_mb = LOAD_RAM_BASE_MB + idx * LOAD_RAM_STEP_MB
+    # pod_override имеет смысл только для KubernetesExecutor
+    extra_load_kwargs = (
+        {"executor_config": _k8s_load_pod_override()} if executor == K8S else {}
+    )
 
     @dag(
         dag_id=dag_id,
@@ -167,11 +298,19 @@ def _build_split_dag(dag_id: str, executor: str, expected_kind: str, group_tag: 
             "retries": 1,
             "retry_delay": timedelta(seconds=15),
         },
-        tags=["executor-split", group_tag, "every-minute"],
+        tags=["executor-split", group_tag, "every-minute", "load"],
         doc_md=(
-            f"Все задачи этого DAG выполняются строго на **{executor}**.\n\n"
-            f"Проверка: лог задачи `report` (вердикт OK/MISMATCH), для Celery — "
-            f"наличие задач в Flower; для Kubernetes — ephemeral-поды и hostname."
+            f"Все задачи на **{executor}**. "
+            f"Нагрузка (#{idx}): CPU {LOAD_CPU_PROCS}×{cpu_seconds}с, "
+            f"RAM {ram_mb} МБ держится всю нагрузку"
+            + (
+                f"; pod requests {K8S_LOAD_REQUESTS['cpu']}/{K8S_LOAD_REQUESTS['memory']}, "
+                f"limits {K8S_LOAD_LIMITS['cpu']}/{K8S_LOAD_LIMITS['memory']}"
+                if executor == K8S
+                else " (внутри пода воркера)"
+            )
+            + ".\n\n"
+            "Проверка: лог `cpu_ram_load` (elapsed/maxrss) и `report` (вердикт OK/MISMATCH)."
         ),
     )
     def _split_dag():
@@ -186,11 +325,22 @@ def _build_split_dag(dag_id: str, executor: str, expected_kind: str, group_tag: 
             task_id="probe_3", executor=executor,
         )("probe 3: executor задан явно (.override)")
 
+        # Нагрузка после проб; для k8s — с pod_override (requests/limits).
+        load = _cpu_ram_load.override(
+            task_id="cpu_ram_load",
+            executor=executor,
+            retries=0,
+            execution_timeout=timedelta(minutes=3),
+            **extra_load_kwargs,
+        )(idx, cpu_seconds, LOAD_CPU_PROCS, ram_mb)
+        [probe_1, probe_2, probe_3] >> load
+
         # report получит результаты всех проб по XCom; зависимости строятся
         # автоматически из переданных XComArg.
-        _report.override(
+        report = _report.override(
             task_id="report", executor=executor,
         )(expected_kind, probe_1, probe_2, probe_3)
+        load >> report
 
     _split_dag()
 
@@ -201,10 +351,12 @@ for _i in range(1, NUM_DAGS_PER_EXECUTOR + 1):
         executor=CELERY,
         expected_kind="celery",
         group_tag="celery",
+        idx=_i,
     )
     _build_split_dag(
         dag_id=f"kubernetes_dag_{_i:02d}",
         executor=K8S,
         expected_kind="kubernetes",
         group_tag="kubernetes",
+        idx=_i,
     )
