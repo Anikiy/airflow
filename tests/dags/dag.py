@@ -1,117 +1,193 @@
-"""Тестовые DAG'и для проверки multi-executor конфигурации (Airflow 3).
+"""
+executor_matrix_test — тест-зонд маршрутизации задач между executor'ами.
 
-Ваш values задан как:
-    executor: "KubernetesExecutor,CeleryExecutor"   # = AIRFLOW__CORE__EXECUTOR
+Стенд: Airflow 3.2.2 (Helm chart 1.22.0, kind), мульти-executor:
+    AIRFLOW__CORE__EXECUTOR = "KubernetesExecutor,CeleryExecutor"
+Дефолтный executor — ПЕРВЫЙ в списке, т.е. KubernetesExecutor.
 
-Правила (официальная дока 3.2.2, "Using Multiple Executors Concurrently"):
-  1. ПЕРВЫЙ executor в списке — дефолтный для всего окружения. У вас это
-     KubernetesExecutor: любая задача БЕЗ явного executor= пойдёт туда.
-  2. Остальные executor'ы списка инициализируются и готовы принимать задачи,
-     если указать их на задаче или DAG'е.
-  3. Per-task: параметр ``executor=`` у оператора / ``@task(executor=...)``.
-  4. Per-DAG: ``default_args={"executor": "..."}`` — все задачи DAG'а
-     наследуют его, если у задачи не задано своё переопределение.
-  5. Если указать executor, которого НЕТ в конфиге — DAG упадёт при парсинге
-     (warning в Airflow UI).
+Матрица проб:
+    1. default_executor        - executor не указан            -> KubernetesExecutor
+    2. kubernetes_explicit     - executor указан явно          -> KubernetesExecutor
+    3. celery_explicit         - executor указан явно          -> CeleryExecutor (воркер)
+    4. kubernetes_pod_override - KubernetesExecutor + pod_override
+                                 (доп. ресурсы и лейблы пода)
+    5. report                  - агрегирует результаты и печатает сводку
 
-Что в файле:
-  - executor_matrix_test  — один DAG, задачи выполняются на ОБОИХ executor'ах;
-  - executor_only__kubernetesexecutor / executor_only__celeryexecutor —
-    два одинаковых DAG'а, целиком приколотых к разным executor'ам
-    (удобно сравнивать side-by-side).
+Где смотреть результат:
+    - лог задачи report (сводная таблица + XCom каждой пробы);
+    - kubectl -n airflow get pods -w  (видно, как KubernetesExecutor
+      создаёт ephemeral-поды для задач во время запуска);
+    - celery-проба выполняется на постоянном поде airflow-worker-N.
 
-Как посмотреть, ГДЕ выполнилась задача:
-  - логи задачи: строка "Задача выполнилась в поде: <hostname>"
-    (Celery -> постоянный под <release>-worker-...; K8s -> ephemeral-под задачи);
-  - kubectl get pods -n airflow -l tier=airflow --watch  (во время запуска
-    k8s-задач появляются короткоживущие поды);
-  - Airflow UI: Grid -> задача -> Details -> атрибут Executor.
+ИСТОРИЯ БАГА, который чинит этот файл:
+    .override() — метод объекта, который возвращает декоратор @task
+    (класс airflow.sdk.bases.task.Task). У обычной def-функции такого
+    атрибута нет, поэтому строка вида
+
+        celery_explicit = _where_am_i.override(executor="CeleryExecutor")
+
+    падала на этапе ПАРСИНГА DAG (dag-processor выполняет тело
+    @dag-функции при импорте файла) с ошибкой:
+        AttributeError: 'function' object has no attribute 'override'
+    Лечение: над _where_am_i должен стоять декоратор @task.
 """
 
-from __future__ import annotations
-
+import json
+import os
+import platform
 import socket
-import time
-from datetime import datetime
 
-from airflow.decorators import dag, task
-from airflow.providers.standard.operators.bash import BashOperator
+import pendulum
+from kubernetes.client import models as k8s
 
-K8S_EXECUTOR = "KubernetesExecutor"
-CELERY_EXECUTOR = "CeleryExecutor"
-
-# Специально подольше, чтобы успеть увидеть ephemeral-под KubernetesExecutor
-# через `kubectl get pods -n airflow --watch`
-TASK_SLEEP_SECONDS = 10
-
-
-def _where_am_i() -> str:
-    """Печатает имя пода, в котором реально выполнилась задача."""
-    host = socket.gethostname()
-    print(f"Задача выполнилась в поде: {host}")
-    print(f"sleep {TASK_SLEEP_SECONDS}s — можно смотреть kubectl get pods -n airflow")
-    time.sleep(TASK_SLEEP_SECONDS)
-    return host
+# Airflow 3.x: канонические импорты из airflow.sdk.
+# (в Airflow 2.x те же сущности живут в airflow.decorators и
+#  airflow.operators.python — fallback оставлен на всякий случай)
+try:
+    from airflow.sdk import dag, get_current_context, task
+except ImportError:  # pragma: no cover
+    from airflow.decorators import dag, task  # type: ignore
+    from airflow.operators.python import get_current_context  # type: ignore
 
 
-# =============================================================================
-# DAG 1: матрица — один DAG, задачи на РАЗНЫХ executor'ах
-# =============================================================================
+def _collect_facts(label: str) -> dict:
+    """Собирает факты о том, где именно выполняется задача.
+
+    Обычная функция (БЕЗ @task): вызывается ВНУТРИ задачи на рантайме,
+    а не при парсинге DAG. Если её по ошибке вызвать снаружи задачи,
+    она выполнится один раз на dag-processor'е — это классическая
+    ошибка TaskFlow, которую мы здесь не повторяем.
+    """
+    context = get_current_context()
+    ti = context["ti"]
+
+    # Какой executor-конфиг активен (через SDK-конфиг или env).
+    configured = ""
+    try:
+        from airflow.sdk import conf
+
+        configured = conf.get("core", "executor")
+    except Exception:
+        configured = os.environ.get("AIRFLOW__CORE__EXECUTOR", "?")
+
+    return {
+        "label": label,
+        "hostname": socket.gethostname(),
+        # KubernetesExecutor выставляет AIRFLOW_IS_K8S_EXECUTOR_POD=True
+        # в pod-шаблоне задачи — самый надёжный маркер k8s-пода.
+        "is_k8s_executor_pod": os.environ.get("AIRFLOW_IS_K8S_EXECUTOR_POD", ""),
+        # celery-воркеры чарта получают переменные брокера из секрета.
+        "has_celery_broker_env": bool(os.environ.get("AIRFLOW__CELERY__BROKER_URL")),
+        "configured_executors": configured,
+        "dag_id": ti.dag_id,
+        "task_id": ti.task_id,
+        "run_id": context["dag_run"].run_id,
+        "try_number": getattr(ti, "try_number", None),
+        "queue": getattr(ti, "queue", None),
+        "pool": getattr(ti, "pool", None),
+        "python": platform.python_version(),
+        "pid": os.getpid(),
+    }
+
+
+@task
+def _where_am_i(label: str) -> dict:
+    """Задача-зонд: печатает и возвращает факты о месте выполнения.
+
+    Декоратор @task превращает функцию в объект airflow.sdk.bases.task.Task,
+    у которого ЕСТЬ метод .override(). Без декоратора .override() не
+    существует — именно это было причиной ImportError вашего DAG.
+    """
+    facts = _collect_facts(label)
+    print(json.dumps(facts, ensure_ascii=False, indent=2, default=str))
+    return facts
+
+
+@task
+def _report(*results: dict) -> None:
+    """Агрегирует пробы всех задач и печатает сводную таблицу."""
+    print("=== EXECUTOR MATRIX: сводка ===")
+    width = max(len(r["label"]) for r in results)
+    for r in results:
+        if r["is_k8s_executor_pod"]:
+            hint = "KubernetesExecutor pod"
+        elif r["has_celery_broker_env"]:
+            hint = "celery worker (по env брокера)"
+        else:
+            hint = "неизвестно (нет маркеров)"
+        print(
+            f'{r["label"].ljust(width)} | host={r["hostname"]} '
+            f'| try#{r["try_number"]} | {hint}'
+        )
+    hosts = {r["hostname"] for r in results}
+    print(f"уникальных хостов: {len(hosts)} из {len(results)} задач")
+    if len(hosts) < len(results):
+        print(
+            "WARNING: несколько задач выполнились на одном хосте. "
+            "Для celery это нормально (несколько задач на одном воркере), "
+            "для k8s-проб — нет."
+        )
+
+
 @dag(
     dag_id="executor_matrix_test",
-    schedule=None,
-    start_date=datetime(2026, 1, 1),
+    schedule=None,  # запуск только вручную
+    start_date=pendulum.datetime(2026, 1, 1, tz="UTC"),
     catchup=False,
-    tags=["test", "multi-executor"],
+    max_active_runs=1,
+    tags=["test", "executors"],
     doc_md=__doc__,
-    # Per-DAG executor: все задачи этого DAG'а по умолчанию — CeleryExecutor.
-    # (Дефолт окружения у вас KubernetesExecutor — первый в списке values.)
-    default_args={"executor": CELERY_EXECUTOR},
 )
 def executor_matrix_test():
-    # 1) Явный CeleryExecutor на задаче (эквивалент BashOperator(executor=...))
-    celery_explicit = _where_am_i.override(
-        task_id="celery__explicit", executor=CELERY_EXECUTOR
-    )()
-
-    # 2) Явный KubernetesExecutor — переопределяет default_args DAG'а
-    k8s_explicit = _where_am_i.override(
-        task_id="k8s__explicit", executor=K8S_EXECUTOR
-    )()
-
-    # 3) Bash на KubernetesExecutor — классический синтаксис из доки
-    k8s_bash = BashOperator(
-        task_id="k8s__bash",
-        executor=K8S_EXECUTOR,
-        bash_command="echo 'pod:' $(hostname); date; sleep 10",
+    # 1. Executor не указан -> дефолтный (первый в AIRFLOW__CORE__EXECUTOR).
+    default_run = _where_am_i.override(task_id="default_executor")(
+        "default: executor не указан -> первый из списка"
     )
 
-    # celery первым, затем две k8s-задачи ПАРАЛЛЕЛЬНО:
-    # в этот момент в кластере одновременно работают оба executor'а
-    celery_explicit >> [k8s_explicit, k8s_bash]
+    # 2. KubernetesExecutor указан явно (полное имя класса, как в конфиге).
+    #    Короткие алиасы ("kubernetes") тоже работают.
+    k8s_run = _where_am_i.override(
+        task_id="kubernetes_explicit",
+        executor="KubernetesExecutor",
+    )("kubernetes: указан явно")
+
+    # 3. CeleryExecutor: задача уйдёт в очередь default к celery-воркерам
+    #    чарта (они слушают очередь default из коробки). Если задача
+    #    зависнет в queued — проверьте, что поды airflow-worker-N живы.
+    celery_run = _where_am_i.override(
+        task_id="celery_explicit",
+        executor="CeleryExecutor",
+    )("celery: указан явно")
+
+    # 4. KubernetesExecutor + executor_config: наш V1Pod стратегически
+    #    мержится с pod_template чарта (включая ваш git-sync init).
+    #    Имя контейнера ОБЯЗАНО совпадать с базовым контейнером шаблона
+    #    ("base"), иначе под не стартует. Init-контейнеры не трогаем —
+    #    они останутся из шаблона.
+    k8s_pod_override = _where_am_i.override(
+        task_id="kubernetes_pod_override",
+        executor="KubernetesExecutor",
+        executor_config={
+            "pod_override": k8s.V1Pod(
+                metadata=k8s.V1ObjectMeta(labels={"where": "pod-override"}),
+                spec=k8s.V1PodSpec(
+                    containers=[
+                        k8s.V1Container(
+                            name="base",
+                            resources=k8s.V1ResourceRequirements(
+                                requests={"cpu": "100m", "memory": "256Mi"},
+                                limits={"cpu": "500m", "memory": "512Mi"},
+                            ),
+                        )
+                    ]
+                ),
+            )
+        },
+    )("kubernetes + pod_override: ресурсы и лейблы пода")
+
+    # report получит результаты всех проб по XCom; зависимости строятся
+    # автоматически из переданных XComArg (все 4 пробы -> report).
+    _report(default_run, k8s_run, celery_run, k8s_pod_override)
 
 
-executor_matrix_test_dag = executor_matrix_test()
-
-
-# =============================================================================
-# DAG 2 и 3: одинаковый тест, каждый целиком на своём executor'е
-# =============================================================================
-for _executor in (K8S_EXECUTOR, CELERY_EXECUTOR):
-    _dag_id = f"executor_only__{_executor.lower()}"
-
-    @dag(
-        dag_id=_dag_id,
-        schedule=None,
-        start_date=datetime(2026, 1, 1),
-        catchup=False,
-        tags=["test", "multi-executor"],
-        default_args={"executor": _executor},  # весь DAG на конкретном executor'е
-        doc_md=f"Клон теста, целиком выполняющийся на **{_executor}**.",
-    )
-    def _make_executor_only_dag():
-        step_1 = _where_am_i.override(task_id="step_1")()
-        step_2 = _where_am_i.override(task_id="step_2")()
-        step_1 >> step_2
-
-    globals()[_dag_id] = _make_executor_only_dag()
+executor_matrix_test()
