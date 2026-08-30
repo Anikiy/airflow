@@ -1,18 +1,123 @@
-from airflow.decorators import dag, task
-from datetime import datetime
+import json
 import time
-import logging
+import random
+import os
+from datetime import datetime
 
-log = logging.getLogger(__name__)
+# ИМПОРТИРУЕМ НАШ КАСТОМНЫЙ ДЕКОРАТОР ВМЕСТО airflow.sdk.task
+from airflow.sdk import task
+from airflow.sdk import dag, get_current_context
 
-@dag(start_date=datetime(2023, 1, 1), schedule=None, catchup=False)
-def simple_timer_dag():
-    @task
-    def wait_and_log():
-        log.info("⏱ Таймер запущен (2 мин)...")
-        time.sleep(120)
-        log.info("✅ Таймер завершён.")
+
+# ---------- ЗАДАЧИ (TASKFLOW) ----------
+
+@task
+def extract_params():
+    # Контекст больше не нужен для переименования процесса, декоратор сделает это сам!
+    params = {
+        "cpu_duration": random.randint(15, 40),
+        "cpu_iterations": random.randint(100_000, 1_000_000),
+        "ram_target_mb": random.randint(30, 150),
+        "ram_hold_time": random.randint(5, 20),
+        "io_duration": random.randint(10, 30),
+    }
+    return params
+
+
+@task
+def cpu_stress(task_params: dict):
+    duration = task_params.get("cpu_duration", 20)
+    iterations = task_params.get("cpu_iterations", 500_000)
+
+    start_time = time.time()
+    while time.time() - start_time < duration:
+        x = 0
+        for i in range(iterations):
+            x += i * i
+        time.sleep(0.1)
+    return {"cpu_work_done": True, "duration": duration}
+
+
+@task
+def ram_stress(task_params: dict):
+    target_size_mb = task_params.get("ram_target_mb", 100)
+    hold_time = task_params.get("ram_hold_time", 15)
+    target_size = target_size_mb * 1024 * 1024
+
+    data = bytearray()
+    try:
+        while len(data) < target_size:
+            chunk_size = 10 * 1024 * 1024
+            data.extend(bytearray(chunk_size))
+            time.sleep(0.5)
+        time.sleep(hold_time)
+    except MemoryError:
+        pass
+    finally:
+        del data
+    return {"ram_work_done": True, "allocated_mb": target_size_mb}
+
+
+@task
+def io_stress(task_params: dict):
+    duration = task_params.get("io_duration", 15)
     
-    wait_and_log()
+    # Если контекст нужен для бизнес-логики (например, для имени файла), 
+    # мы можем запросить его явно через get_current_context()
+    ctx = get_current_context()
+    dag_id = ctx['dag'].dag_id
+    task_id = ctx['ti'].task_id
+    
+    dummy_file = f"/tmp/airflow_io_test_{dag_id}_{task_id}.bin"
+    start_time = time.time()
+    
+    try:
+        while time.time() - start_time < duration:
+            with open(dummy_file, "wb") as f:
+                f.write(os.urandom(10 * 1024 * 1024))
+            time.sleep(0.5)
+    finally:
+        if os.path.exists(dummy_file):
+            os.remove(dummy_file)
+    return {"io_work_done": True, "duration": duration}
 
-simple_timer_dag()
+
+@task
+def validate_results(cpu_result: dict, ram_result: dict, io_result: dict):
+    # Процесс уже переименован декоратором!
+    time.sleep(random.uniform(1, 3))
+    return {"validated": True}
+
+
+@task
+def summarize_results(validation: dict):
+    ctx = get_current_context()
+    dag_id = ctx['dag'].dag_id
+    summary = {"dag_id": dag_id, "status": "completed", "timestamp": datetime.now().isoformat()}
+    print(f"SUMMARY [{dag_id}]: {json.dumps(summary, indent=2)}")
+    return summary
+
+
+# ---------- ФАБРИКА DAG ----------
+def create_stress_pipeline(dag_id: str):
+    @dag(
+        dag_id=dag_id,
+        schedule="*/1 * * * *",  # Запуск каждую минуту
+        start_date=datetime(2023, 1, 1),
+        catchup=False,
+        tags=["CPU", "RAM", "IO", "LoadTest", "MultiDag"],
+        default_args={"retries": 1, "retry_delay": 30},
+    )
+    def stress_pipeline():
+        params = extract_params()
+        cpu_res = cpu_stress(task_params=params)
+        ram_res = ram_stress(task_params=params)
+        io_res = io_stress(task_params=params)
+        validation = validate_results(cpu_result=cpu_res, ram_result=ram_res, io_result=io_res)
+        summarize_results(validation)
+    return stress_pipeline()
+
+# Регистрируем 5 DAG-ов
+for i in range(1, 10):
+    dag_name = f"stress_test_dag_{i:02d}"
+    globals()[dag_name] = create_stress_pipeline(dag_name)
