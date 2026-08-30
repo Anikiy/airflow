@@ -33,9 +33,11 @@
       (kubectl top может не работать — в kind нет metrics-server).
 
 Безопасность:
-    - RAM ограничена (<=224 МБ на задачу), CPU-процессы daemon=True
-      (умрут вместе с родителем), execution_timeout=3 мин, retries=0
-      (нагрузка не перезапускается);
+    - RAM ограничена (<=224 МБ на задачу); CPU-спиннеры — subprocess-дети
+      с самозатуханием по дедлайну (НЕ multiprocessing: задача Airflow 3
+      живёт в daemon-процессе, которому запрещено плодить mp-детей —
+      "AssertionError: daemonic processes are not allowed to have children"),
+      execution_timeout=3 мин, retries=0 (нагрузка не перезапускается);
     - worst case celery: 10 задач/мин на 5 воркеров = до 2 нагрузок
       на воркер (4 ядра на 11-20 сек, ~450 МБ пиково);
     - если kind давится: LOAD_CPU_PROCS=1, LOAD_RAM_STEP_MB=8, cron "*/2".
@@ -127,40 +129,49 @@ def _where_am_i(label: str) -> dict:
 
 # --- нагрузка CPU/RAM ------------------------------------------------------
 
+_SPIN_SOURCE = """
+import sys, time
+seconds = float(sys.argv[1])
+stop = time.monotonic() + seconds
+x = 1.000001
+while time.monotonic() < stop:
+    for _ in range(50_000):
+        x = (x * 1.0000001) % 999_983
+"""
+
+
 def _generate_cpu_load(seconds: int, procs: int) -> dict:
     """Жжёт CPU: `procs` дочерних процессов по 100% ядра `seconds` секунд.
 
-    Обычная функция (не @task) — удобно вынести и тестировать отдельно.
+    ВАЖНО: это subprocess.Popen, а НЕ multiprocessing.Process.
+    Причина: Airflow 3 task runner исполняет задачу внутри daemon-процесса,
+    а Python запрещает daemon-процессам создавать детей через
+    multiprocessing ("AssertionError: daemonic processes are not allowed
+    to have children"). На subprocess это ограничение не распространяется.
+    Каждый спиннер самозатухает по своему дедлайну — даже если родитель
+    умрёт раньше, дети не останутся висеть.
     """
-    import multiprocessing as mp
+    import subprocess as sp
+    import sys
     import time
 
-    def _spin(stop_ts: float) -> None:
-        x = 1.000001
-        while time.monotonic() < stop_ts:
-            for _ in range(50_000):
-                x = (x * 1.0000001) % 999_983
-
     started = time.monotonic()
-    stop_ts = started + seconds
-    ctx = (
-        mp.get_context("fork")
-        if "fork" in mp.get_all_start_methods()
-        else mp.get_context("spawn")
-    )
-    workers = [
-        ctx.Process(target=_spin, args=(stop_ts,), daemon=True)
+    children = [
+        sp.Popen([sys.executable, "-c", _SPIN_SOURCE, str(seconds)])
         for _ in range(max(1, procs))
     ]
-    for w in workers:
-        w.start()
-    for w in workers:
-        w.join(timeout=seconds + 60)
+    exitcodes = []
+    for c in children:
+        try:
+            exitcodes.append(c.wait(timeout=seconds + 60))
+        except sp.TimeoutExpired:
+            c.kill()
+            exitcodes.append(c.wait())
     return {
-        "procs": len(workers),
+        "procs": len(children),
         "seconds": seconds,
         "elapsed_sec": round(time.monotonic() - started, 1),
-        "exitcodes": [w.exitcode for w in workers],
+        "exitcodes": exitcodes,
     }
 
 
