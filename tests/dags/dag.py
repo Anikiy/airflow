@@ -1,152 +1,210 @@
+"""
+Семейства celery_dag_NN (10 шт.) и kubernetes_dag_NN (10 шт.) — сплит 10/10.
+
+Стенд: Airflow 3.2.2 (Helm chart 1.22.0, kind), мульти-executor:
+    AIRFLOW__CORE__EXECUTOR = "KubernetesExecutor,CeleryExecutor"
+Дефолтный executor — ПЕРВЫЙ в списке, т.е. KubernetesExecutor.
+
+Отличие от прошлой версии (executor_matrix_test_NN):
+    - старые DAG'и ИСЧЕЗНУТ из UI после синка этого файла (файл заменён);
+    - теперь 20 DAG'ов с ЧИСТЫМ сплитом: 10 строго celery + 10 строго k8s;
+    - НЕТ перекрёстных задач (никаких celery_explicit внутри k8s-DAG'а);
+    - КАЖДАЯ задача пинается ЯВНО через .override(executor=...) И ПЛЮС
+      default_args={"executor": ...} на весь DAG. Маршрутизация больше не
+      зависит от того, какой executor дефолтный в кластере.
+
+Имена DAG'ов = их executor (удобно фильтровать в UI по тегам
+"celery" / "kubernetes" и смотреть в Flower: celery_dag_* там есть,
+kubernetes_dag_* там быть НЕ должно — это норма).
+
+Как проверить, что сплит работает (минимум ручной работы):
+    1) открой любой запуск -> задача `report` -> лог: таблица проб и
+       вердикт "VERDICT: OK" / "VERDICT: MISMATCH" + XCom с summary;
+    2) celery_dag_*: hostname задач = airflow-worker-N (StatefulSet воркеров);
+    3) kubernetes_dag_*: hostname = имя ephemeral-пода, маркер
+       AIRFLOW_IS_K8S_EXECUTOR_POD=True; в `kubectl get pods -n airflow` при
+       каждом запуске мелькают поды kubernetes-dag-*-*;
+    4) UI: Task Instance Details -> Hostname; теги celеry/kubernetes.
+
+Нагрузка (20 DAG'ов, cron раз в минуту, по 4 задачи):
+    ~30 ephemeral-подов k8s + ~30 celery-задач в минуту.
+    Если kind не справляется: CRON = "*/2 * * * *" или пауза части DAG'ов.
+
+Служебное (чтобы не регрессировать):
+    .override() есть только у объекта, возвращаемого декоратором @task
+    (airflow.sdk.bases.task.Task). У обычной def-функции его нет — именно это
+    давало "AttributeError: 'function' object has no attribute 'override'"
+    при парсинге DAG.
+"""
+
 import json
 import os
-import random
-import time
-from datetime import datetime
+import platform
+import socket
+from datetime import timedelta
 
-from airflow.sdk import dag, get_current_context, task
+import pendulum
 
-# ---------- ЭКЗЕКУТОРЫ ----------
-CELERY = "celery"          # alias CeleryExecutor
-KUBERNETES = "kubernetes"  # alias KubernetesExecutor
-
-# Override ресурсов пода — нужен только KubernetesExecutor'у,
-# CeleryExecutor этот параметр просто игнорирует, поэтому передаём всегда.
 try:
-    from kubernetes.client import models as k8s
+    from airflow.sdk import dag, get_current_context, task
+except ImportError:  # pragma: no cover — fallback для Airflow 2.x
+    from airflow.decorators import dag, task  # type: ignore
+    from airflow.operators.python import get_current_context  # type: ignore
 
-    K8S_POD_OVERRIDE = {
-        "pod_override": k8s.V1Pod(
-            spec=k8s.V1PodSpec(
-                containers=[
-                    k8s.V1Container(
-                        name="base",
-                        resources=k8s.V1ResourceRequirements(
-                            requests={"cpu": "500m", "memory": "512Mi"},
-                            limits={"cpu": "2", "memory": "1Gi"},
-                        ),
-                    )
-                ]
-            )
-        )
+NUM_DAGS_PER_EXECUTOR = 10
+CRON = "* * * * *"  # каждую минуту
+
+CELERY = "CeleryExecutor"
+K8S = "KubernetesExecutor"
+
+
+def _collect_facts(label: str) -> dict:
+    """Факты о месте выполнения.
+
+    Обычная функция (БЕЗ @task): вызывается на рантайме ВНУТРИ задачи,
+    а не при парсинге DAG.
+    """
+    context = get_current_context()
+    ti = context["ti"]
+
+    configured = ""
+    try:
+        from airflow.sdk import conf
+
+        configured = conf.get("core", "executor")
+    except Exception:
+        configured = os.environ.get("AIRFLOW__CORE__EXECUTOR", "?")
+
+    return {
+        "label": label,
+        "hostname": socket.gethostname(),
+        # Маркер KubernetesExecutor: выставляется True в pod-шаблоне задачи.
+        "is_k8s_executor_pod": os.environ.get("AIRFLOW_IS_K8S_EXECUTOR_POD", ""),
+        # celery-воркеры чарта имеют переменные брокера из секрета.
+        "has_celery_broker_env": bool(os.environ.get("AIRFLOW__CELERY__BROKER_URL")),
+        "configured_executors": configured,
+        "dag_id": ti.dag_id,
+        "task_id": ti.task_id,
+        "run_id": context["dag_run"].run_id,
+        "try_number": getattr(ti, "try_number", None),
+        "queue": getattr(ti, "queue", None),
+        "pool": getattr(ti, "pool", None),
+        "python": platform.python_version(),
+        "pid": os.getpid(),
     }
-except ImportError:
-    K8S_POD_OVERRIDE = None
 
 
-# ---------- ФАБРИКА DAG ----------
-def create_stress_pipeline(dag_id: str, executor: str):
-    """Создаёт DAG, все задачи которого выполняются на заданном executor."""
+@task
+def _where_am_i(label: str) -> dict:
+    """Задача-зонд: печатает и возвращает факты о месте выполнения.
+
+    @task обязателен — только декорированный объект имеет .override().
+    """
+    facts = _collect_facts(label)
+    print(json.dumps(facts, ensure_ascii=False, indent=2, default=str))
+    return facts
+
+
+def _observed_kind(facts: dict) -> str:
+    """Классификация места выполнения по надёжным маркерам.
+
+    1) маркер пода KubernetesExecutor — авторитетный для k8s;
+    2) иначе celery, если есть env брокера или hostname воркера;
+    3) иначе unknown.
+    """
+    if str(facts.get("is_k8s_executor_pod", "")).strip().lower() == "true":
+        return "kubernetes"
+    hostname = str(facts.get("hostname", ""))
+    if facts.get("has_celery_broker_env") or hostname.startswith("airflow-worker"):
+        return "celery"
+    return "unknown"
+
+
+@task
+def _report(expected_kind: str, *results: dict) -> dict:
+    """Сводная таблица проб + вердикт: все ли задачи на ожидаемом executor'е."""
+    print(f"=== EXPECTED executor: {expected_kind} ===")
+    width = max(len(r["label"]) for r in results)
+    for r in results:
+        kind = _observed_kind(r)
+        marker = "OK" if kind == expected_kind else "MISMATCH"
+        print(
+            f'{r["label"].ljust(width)} | host={r["hostname"]} '
+            f'| try#{r["try_number"]} | observed={kind} | {marker}'
+        )
+
+    observed_kinds = sorted({_observed_kind(r) for r in results})
+    mismatches = [r["task_id"] for r in results if _observed_kind(r) != expected_kind]
+    verdict = "OK" if not mismatches else "MISMATCH"
+    hosts = sorted({r["hostname"] for r in results})
+
+    print(f"configured executors (env core.executor): {results[0]['configured_executors']}")
+    print(f"observed kinds: {observed_kinds}")
+    print(f"уникальных хостов: {len(hosts)} из {len(results)} задач -> {hosts}")
+    print(f"VERDICT: {verdict} (expected={expected_kind}, mismatched={mismatches})")
+
+    return {
+        "expected": expected_kind,
+        "observed": observed_kinds,
+        "verdict": verdict,
+        "hosts": hosts,
+        "mismatched_tasks": mismatches,
+    }
+
+
+def _build_split_dag(dag_id: str, executor: str, expected_kind: str, group_tag: str) -> None:
+    """Фабрика одного DAG'а; цикл в конце файла создаёт 10 celery + 10 k8s."""
 
     @dag(
         dag_id=dag_id,
-        schedule="*/1 * * * *",
-        start_date=datetime(2023, 1, 1),
-        catchup=False,
-        tags=["CPU", "RAM", "IO", "LoadTest", executor],
-        default_args={"retries": 1, "retry_delay": 30},
+        schedule=CRON,
+        start_date=pendulum.datetime(2026, 1, 1, tz="UTC"),
+        catchup=False,                          # не догонять пропущенные интервалы
+        max_active_runs=1,                      # не копить очередь, если запуск > 1 мин
+        dagrun_timeout=timedelta(minutes=5),    # самоубийство зависшего запуска
+        default_args={
+            "executor": executor,               # страховка на уровне всего DAG'а
+            "retries": 1,
+            "retry_delay": timedelta(seconds=15),
+        },
+        tags=["executor-split", group_tag, "every-minute"],
+        doc_md=(
+            f"Все задачи этого DAG выполняются строго на **{executor}**.\n\n"
+            f"Проверка: лог задачи `report` (вердикт OK/MISMATCH), для Celery — "
+            f"наличие задач в Flower; для Kubernetes — ephemeral-поды и hostname."
+        ),
     )
-    def stress_pipeline():
+    def _split_dag():
+        # 3 независимых пробы; каждая ЯВНО пинается на executor DAG'а.
+        probe_1 = _where_am_i.override(
+            task_id="probe_1", executor=executor,
+        )("probe 1: executor задан явно (.override)")
+        probe_2 = _where_am_i.override(
+            task_id="probe_2", executor=executor,
+        )("probe 2: executor задан явно (.override)")
+        probe_3 = _where_am_i.override(
+            task_id="probe_3", executor=executor,
+        )("probe 3: executor задан явно (.override)")
 
-        @task(executor=executor, executor_config=K8S_POD_OVERRIDE)
-        def extract_params():
-            return {
-                "cpu_duration": random.randint(15, 40),
-                "cpu_iterations": random.randint(100_000, 1_000_000),
-                "ram_target_mb": random.randint(30, 150),
-                "ram_hold_time": random.randint(5, 20),
-                "io_duration": random.randint(10, 30),
-            }
+        # report получит результаты всех проб по XCom; зависимости строятся
+        # автоматически из переданных XComArg.
+        _report.override(
+            task_id="report", executor=executor,
+        )(expected_kind, probe_1, probe_2, probe_3)
 
-        @task(executor=executor, executor_config=K8S_POD_OVERRIDE)
-        def cpu_stress(task_params: dict):
-            duration = task_params.get("cpu_duration", 20)
-            iterations = task_params.get("cpu_iterations", 500_000)
-
-            start_time = time.time()
-            while time.time() - start_time < duration:
-                x = 0
-                for i in range(iterations):
-                    x += i * i
-                time.sleep(0.1)
-            return {"cpu_work_done": True, "duration": duration}
-
-        @task(executor=executor, executor_config=K8S_POD_OVERRIDE)
-        def ram_stress(task_params: dict):
-            target_size_mb = task_params.get("ram_target_mb", 100)
-            hold_time = task_params.get("ram_hold_time", 15)
-            target_size = target_size_mb * 1024 * 1024
-
-            data = bytearray()
-            try:
-                while len(data) < target_size:
-                    data.extend(bytearray(10 * 1024 * 1024))
-                    time.sleep(0.5)
-                time.sleep(hold_time)
-            except MemoryError:
-                pass
-            finally:
-                del data
-            return {"ram_work_done": True, "allocated_mb": target_size_mb}
-
-        @task(executor=executor, executor_config=K8S_POD_OVERRIDE)
-        def io_stress(task_params: dict):
-            duration = task_params.get("io_duration", 15)
-
-            ctx = get_current_context()
-            dag_id_ = ctx["dag"].dag_id
-            task_id_ = ctx["ti"].task_id
-
-            dummy_file = f"/tmp/airflow_io_test_{dag_id_}_{task_id_}.bin"
-            start_time = time.time()
-
-            try:
-                while time.time() - start_time < duration:
-                    with open(dummy_file, "wb") as f:
-                        f.write(os.urandom(10 * 1024 * 1024))
-                    time.sleep(0.5)
-            finally:
-                if os.path.exists(dummy_file):
-                    os.remove(dummy_file)
-            return {"io_work_done": True, "duration": duration}
-
-        @task(executor=executor, executor_config=K8S_POD_OVERRIDE)
-        def validate_results(cpu_result: dict, ram_result: dict, io_result: dict):
-            time.sleep(random.uniform(1, 3))
-            return {"validated": True}
-
-        @task(executor=executor, executor_config=K8S_POD_OVERRIDE)
-        def summarize_results(validation: dict):
-            ctx = get_current_context()
-            dag_id_ = ctx["dag"].dag_id
-            summary = {
-                "dag_id": dag_id_,
-                "executor": executor,
-                "status": "completed",
-                "timestamp": datetime.now().isoformat(),
-            }
-            print(f"SUMMARY [{dag_id_}] on {executor}: {json.dumps(summary, indent=2)}")
-            return summary
-
-        # ---------- ГРАФ ----------
-        params = extract_params()
-        cpu_res = cpu_stress(params)
-        ram_res = ram_stress(params)
-        io_res = io_stress(params)
-        validation = validate_results(cpu_res, ram_res, io_res)
-        summarize_results(validation)
-
-    return stress_pipeline()
+    _split_dag()
 
 
-# ---------- РЕГИСТРАЦИЯ: 10 DAG на Celery + 10 DAG на Kubernetes ----------
-
-# 10 DAG-ов на CeleryExecutor
-for i in range(1, 11):
-    dag_name = f"stress_celery_dag_{i:02d}"
-    globals()[dag_name] = create_stress_pipeline(dag_name, CELERY)
-
-# 10 DAG-ов на KubernetesExecutor
-for i in range(1, 11):
-    dag_name = f"stress_kubernetes_dag_{i:02d}"
-    globals()[dag_name] = create_stress_pipeline(dag_name, KUBERNETES)
+for _i in range(1, NUM_DAGS_PER_EXECUTOR + 1):
+    _build_split_dag(
+        dag_id=f"celery_dag_{_i:02d}",
+        executor=CELERY,
+        expected_kind="celery",
+        group_tag="celery",
+    )
+    _build_split_dag(
+        dag_id=f"kubernetes_dag_{_i:02d}",
+        executor=K8S,
+        expected_kind="kubernetes",
+        group_tag="kubernetes",
+    )
